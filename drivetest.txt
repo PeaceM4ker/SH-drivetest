@@ -1,0 +1,155 @@
+#!/bin/bash
+pfile=/root/log.txt
+echo "" > $pfile
+rescue=`hostname`
+if [ $rescue != "rescue.singlehop.net" ]
+then
+  exit 1
+fi
+
+raid_ex() {
+  echo "Deleting previous RAID volumes" >> $pfile
+  for i in {0..9}
+  do
+    storcli /c0/v$i del force > /dev/null
+  done
+  echo "Deleting any foreign configurations" >> $pfile
+  storcli /c0 /fall del > /dev/null
+  echo "Making sure JBOD mode is set to on" >> $pfile
+  storcli /c0 set jbod=on > /dev/null
+  echo "Setting JBOD on all Disks" >> $pfile
+  for i in {0..100}
+  do
+    storcli /c0/e252/s$i set jbod > /dev/null
+  done
+}
+
+details(){
+  if [ $drive == "wd" ]
+  then
+    smartread=$((`smartctl -a $path | grep Read_Error | awk '{print $NF}'` + `smartctl -a $path | grep Seek_Error_Rate | awk '{print $NF}'`))
+    smartwrite=$((`smartctl -a $path | grep UDMA | awk '{print $NF}'` + `smartctl -a $path | grep Multi_Zone | awk '{print $NF}'` + `smartctl -a $path | grep Offline_Uncorrectable | awk '{print $NF}'`))
+    power=`smartctl -a $path | grep "Power_On" | awk '{print $NF}'`
+    serial=`smartctl -i $path | grep "Serial Number" | sed 's|Serial Number:    ||g'`
+
+  elif [ $drive == "SAS" ]
+  then
+    smartread=`smartctl -a $path | grep "read:     " | awk '{print $NF}'`
+    smartwrite=`smartctl -a $path | grep "write:     " | awk '{print $NF}'`
+    power=`smartctl -a $path | grep "hours powered" | awk '{print $NF}'`
+    #power=${p%.*}
+    serial=`smartctl -i $path | grep "Serial number" | awk '{print $NF}'`
+
+  elif [ $drive == "intel" ]
+  then
+    mediawear=`smartctl -a $path | grep Media_Wearout_Indicator | awk '{print $5}'`
+    error=$((`smartctl -a $path | grep Reallocated_Sector | awk '{print $NF}'` + `smartctl -a $path | grep End-to-End  | awk '{print $NF}'` + `smartctl -a $path | grep Uncorrect  | awk '{print $NF}'` ))
+    power=`smartctl -a $path | grep "Power_On" | awk '{print $NF}'`
+    serial=`smartctl -i $path | grep "Serial Number" | sed 's|Serial Number:    ||g'`
+
+  elif [ $drive == "samsung" ]
+  then
+    mediawear=`smartctl -a $path | grep Wear_Leveling | awk '{print $5}'`
+    error=$((`smartctl -a $path | grep Reallocated_Sector | awk '{print $NF}'` + `smartctl -a $path | grep Program_Fail | awk '{print $NF}'` + `smartctl -a $path | grep End-to-End  | awk '{print $NF}'` + `smartctl -a $path | grep Runtime_Bad  | awk '{print $NF}'` + `smartctl -a $path | grep Reported_Uncorrect  | awk '{print $NF}'` + `smartctl -a $path | grep UDMA_CRC_Error_Count  | awk '{print $NF}'` ))
+    power=`smartctl -a $path | grep "Power_On" | awk '{print $NF}'`
+    serial=`smartctl -i $path | grep "Serial Number" | sed 's|Serial Number:    ||g'`
+
+  elif [ $drive == "seagate" ]
+  then
+    smartread=$((`smartctl -a $path | grep Read_Error | awk '{print $NF}'` + `smartctl -a $path | grep Seek_Error | awk '{print $NF}'` + `smartctl -a $path | grep ECC_Recovered | awk '{print $NF}'`))
+    smartwrite=$((`smartctl -a $path | grep Reported_Uncorrect | awk '{print $NF}'` + `smartctl -a $path | grep Offline_Uncorrectable | awk '{print $NF}'` + `smartctl -a $path | grep UDMA  | awk '{print $NF}'`))
+    power=`smartctl -a $path | grep "Power_On" | awk '{print $NF}'`
+    serial=`smartctl -i $path | grep "Serial Number" | sed 's|Serial Number:    ||g'`
+  else
+    echo "ERROR!!! NO IDEA WHAT TYPE OF DRIVE THIS IS: "$path
+  fi
+}
+
+wipe(){
+  echo "Executing wipe on $path" >> $pfile
+  shred -n 1 $path
+  echo "Wipe completed on $path" >> $pfile
+  wait
+}
+
+filenaming(){
+  filename=/root/results.txt
+  if [ $drive == "wd" ] || [ $drive == "seagate" ]
+  then
+    echo "SERIAL="$serial" :READ ERRORS="$smartread" : WRITE ERRORS="$smartwrite" : POWERON HOURS="$power >> "$filename"
+  elif [ $drive == "SAS" ]
+  then
+    echo "SERIAL="$serial" :READ ERRORS="$smartread" : WRITE ERRORS="$smartwrite" : POWERON HOURS="$power >> "$filename"
+  elif [ $drive == "samsung" ] || [ $drive == "intel" ]
+  then
+    echo "SERIAL="$serial" :MEDIAWEAROUT="$mediawear" : SSDERRORS="$error" : POWERON HOURS="$power >> "$filename"
+  fi
+}
+
+echo "Searching for a Drive Controller" >> $pfile
+noraid=`storcli /c0 show | grep "Controller 0 not found"`
+raid=`storcli /c0 show | grep "[0-9]i"`
+check_9260=`storcli /c0 show | grep "9260-[0-9]i" -o`
+
+if [ -n "$noraid" ]
+then
+  echo "SATA Controller found!" >> $pfile
+elif [ -n "$raid" ]
+then
+  if [ -z "$check_9260" ]
+  then
+    echo "LSI Controller found!" >> $pfile
+    echo "Deleting RAID stuff" >> $pfile
+    raid_ex
+  elif [ -n "$check_9260" ]
+  then
+    echo "FATAL: 9260 series controller found!" >> $pfile
+    echo "drive firmware passthrough is unsupported on this series! remove RAID card and restart the test" >> $pfile
+    exit
+  fi
+else
+  echo "FATAL: Could not determine what Controller I am behind" >> $pfile
+  exit
+fi
+for i in {a..z}
+do
+  path="/dev/sd"$i
+  if [ -e $path ]
+  then
+    wipe &
+  fi
+done
+wait
+echo "Creating Files and Cleaning up" >> $pfile
+for i in range {a..z}
+do
+  path="/dev/sd"$i
+  if [ -e $path ]
+  then
+    wait
+    wd=`smartctl -a $path | grep WD`
+    SAS=`smartctl -a $path | grep SEAGATE`
+    seagate=`smartctl -a $path | grep -E ST[0-9]{4}[A-Z][A-Z][0-9]* -o`
+    intel=`smartctl -a $path | grep INTEL`
+    samsung=`smartctl -a $path | grep SAMSUNG`
+    if [ -n "$wd" ]
+    then
+      drive="wd"
+    elif [ -n "$SAS" ]
+    then
+      drive="SAS"
+    elif [ -n "$intel" ]
+    then
+      drive="intel"
+    elif [ -n "$samsung" ]
+    then
+      drive="samsung"
+    elif [ -n "$seagate" ]
+    then
+      drive="seagate"
+    fi
+    details
+    filenaming
+  fi
+done
+exit
